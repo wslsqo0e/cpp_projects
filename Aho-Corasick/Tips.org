@@ -1,0 +1,437 @@
+* Aho-Corasick
+** 代码分析
+** 核心数据结构
+   核心数据结构如下
+   #+begin_src c++
+     typedef struct {
+       unsigned state;
+       unsigned strno;
+     } STRASH;
+
+     typedef struct acism {
+       unsigned* tranv;
+       STRASH* hashv;
+       unsigned flags;
+
+       unsigned sym_mask;   // =~(~0 << sym_bits)     等价于 2**sym_bits - 1
+       unsigned sym_bits;  // 存储number nsyms 需要多少字节  1 + floor(log2(nsyms))
+
+       unsigned hash_mod; // search hashv starting at (state + sym) % hash_mod.
+       unsigned hash_size; // #(hashv): hash_mod plus the overflows past [hash_mod-1]
+       unsigned tran_size; // #(tranv)
+       unsigned nsyms;     // pattern中出现所有characters种类数 + 1
+       unsigned nchars;    // pattern串总长度 相加得到
+       unsigned nstrs;     // pattern串数量
+       unsigned maxlen;    // pattern串的最长长度
+       unsigned short symv[256];
+     } ACISM;
+   #+end_src
+
+   构建Trie时节点的数据结构
+   #+begin_src c++
+     typedef struct tnode {
+       // child 执行首个子节点， next 指向兄弟节点， back 指向回退节点
+       struct tnode *child, *next, *back;
+       // nrefs was used in "prune_backlinks".
+       //  It will be used again in "curtail".
+       unsigned    nrefs;             // 当前节点作为back被引用的次数
+       unsigned    state;             // 转化为数组时的位置信息
+       unsigned    match;            // 标记是否到达词尾，完成一个词匹配
+       unsigned short    sym;        // 词编号
+       char        is_suffix;      // "bool"
+     } TNODE;
+   #+end_src
+** 初始化 ACISM 数据结构
+   对待匹配pattern进行构建时，首先利用 ~fill_symv~ 填充 ACISM 数据结构
+   #+begin_src c++
+     typedef struct {
+       int freq;
+       int rank;
+     } FRANK;
+
+     static int frcmp(FRANK*a, FRANK*b) { return a->freq - b->freq; }
+
+     static void fill_symv(ACISM *psp, MEMREF const *strv, int nstrs) {
+       int i, j;
+       FRANK frv[256];   // one byte, 256 character, 用于统计每个character的频次
+
+       for (i = 0; i < 256; ++i) frv[i] = (FRANK){0,i};
+       for (i = 0; i < nstrs; ++i) {
+         for (psp->nchars += j = strv[i].len; --j >= 0;) {   // psp->nchars 所有匹配字符串总长度
+           frv[(uint8_t)strv[i].ptr[j]].freq++;
+         }
+       }
+
+       qsort(frv, 256, sizeof*frv, (qsort_cmp)frcmp);  // 按照freq从小到大排序, rank记录对应字符的ACSII 码
+
+       for (i = 256; --i >= 0 && frv[i].freq;)
+         psp->symv[frv[i].rank] = ++psp->nsyms;       // psp->nsyms 记录出现character的种类数
+       ++psp->nsyms;                                  // 出现种类数 +1
+
+       psp->sym_bits = bitwid(psp->nsyms);      // 获得存储psp->nsyms所需的字节数
+       psp->sym_mask = ~(~0 << psp->sym_bits);  // 0b11..1   共计 psp->sym_bits 位非零
+     }
+
+   #+end_src
+** 构建Trie树
+   然后调用 ~create_tree~ 方法
+   #+begin_src c++
+
+     // TNODE *Tree, 数组总长度为 psp->nchars + 1
+     // 此时构建，所有的back都指向根节点
+     static int create_tree(TNODE *Tree, unsigned short const *symv, MEMREF const *strv, int nstrs)
+     {
+       int i, j;
+       TNODE *nextp = Tree + 1;
+
+       for (i = 0; i < nstrs; ++i) {    // 依次处理每个匹配字符串
+         TNODE *tp = Tree;              // current node
+
+         for (j = 0; tp->child && j < (int)strv[i].len; ++j) {
+           unsigned short sym = symv[(uint8_t)strv[i].ptr[j]];    // sym， character音素的编号，非零
+                                                                  // 插入新的节点，如果相等，则不会插入
+           if (sym < tp->child->sym) {
+             // Prep to insert new node before tp->child
+             nextp->next = tp->child;
+             break;
+           }
+
+           tp = tp->child;
+           while (tp->next && sym >= tp->next->sym) {
+             tp = tp->next;
+           }
+
+           // Insert new siblint after tp
+           if (sym > tp->sym) {
+             nextp->next = tp->next;
+             tp = tp->next = nextp++;
+             tp->sym = sym;
+             tp->back = Tree;
+           }
+         }
+
+         for (; j < (int) strv[i].len; ++j) {         // 构建子节点
+           tp = tp->child = nextp++;
+           tp->sym = symv[(uint8_t)strv[i].ptr[j]];
+           tp->back = Tree;
+         }
+         tp->match = i + 1; // 标记匹配到一个pattern
+       }
+     }
+   #+end_src
+** Trie树添加 backlink
+   接着调用 ~add_backlink~ 更新 ~TNODE::back~
+   #+begin_src c++
+     static TNODE * find_child(TNODE *tp, unsigned short sym)
+     {
+       for (tp = tp->child; tp && tp->sym < sym; tp = tp->next);
+       return tp && tp->sym == sym ? tp : NULL;
+     }
+
+     // v1 v2 都是 nstrs + 1 个 TNODE指针
+     static void add_backlinks(TNODE *troot, TNODE **v1, TNODE **v2) {
+       TNODE *tp, **tmp;
+
+       // troot 第一层子节点 拷贝到 v1 中
+       for (tp = troot->child, tmp = v1; tp; tp = tp->next)
+         ,*tmp++ = tp;
+       ,*tmp = NULL;
+
+       while(*v1) {
+         TNODE **spp = v1, **dpp = v2, *srcp, *dstp;
+
+         while ((srcp = *spp++)) {         // 遍历 v1 中保存的 cur 层子节点
+           for (dstp = srcp->child; dstp; dstp = dstp->next) {   // 遍历 cur+1 层子节点
+             TNODE *bp = NULL;
+             if (dstp->child) {
+               ,*dpp++ = dstp;           // 如果 cur+1 层节点存在 cur+2 节点，则存入v2， v2保存第 cur+1 层节点
+             }
+             for (tp = srcp->back; tp; tp = tp->back) {
+               if ((bp = find_child(tp, dstp->sym)))
+                 break;
+             }
+             if (!bp) {
+               bp = troot;
+             }
+             // srcp -> dstp   找到匹配的  tp -> bp   进行backlink
+             dstp->back = dstp->child ? bp : tp ? tp : troot;    // dstp 有child，回退到同样字符的节点，否则回退到前一个字符的节点
+             dstp->back->nrefs++;      // 当前节点作为back，被引用次数
+             dstp->is_suffix = bp->match || bp->is_suffix;
+           }
+         }
+         ,*dpp = 0;
+         tmp = v1; v1 = v2; v2 = tmp;
+       }
+     }
+   #+end_src
+** Interleave 数组化位置分配
+   调用 ~interleave~ 方法
+   #+begin_src c++
+     // 主要目的就是更新 TNODE::state
+     static int
+     interleave(TNODE *troot, int nnodes, int nsyms, TNODE **v1, TNODE **v2) {
+       unsigned usev_size = nnodes + nsyms;      // 构建字典树使用的节点总数加characters种类数
+       char *usev = static_cast<char*>(calloc(usev_size, sizeof*usev));  // 标记数组，初始大小是个启发式的数值
+       unsigned last_trans = 0;
+       unsigned startv[257][2] = { 0 };
+       TNODE *cp, **tmp;
+
+       memset(startv, 0, nsyms * sizeof*startv);   // 初始化为0，仅初始化前 nsyms 个即可
+       v1[0] = troot, v1[1] = NULL;
+       for (; *v1; tmp = v1, v1 = v2, v2 = tmp) {
+         TNODE **srcp = v1, **dstp = v2, *tp;
+         while ((tp = *srcp++)) {       // tp 指向 cur 层节点
+           if (!tp->child) continue;
+
+           if (tp->back == troot) tp->back = NULL; // simplify tests.
+           cp = tp->child;              // tp -> cp
+
+           unsigned pos, *startp = &startv[cp->sym][!!tp->back]; // tp->back 有效为1 无效为0
+           while ((cp = cp->next)) {
+             unsigned *newp = &startv[cp->sym][!!tp->back];
+             if (*startp < *newp) startp = newp;      // startp 指向的位置 包含的值最大
+           }
+
+           char need = tp->back ? BASE|USED : BASE;     // need 为 0b11 或者 0b10
+           for (pos = *startp; ; ++pos) {     // 从startp 指向位置的值开始
+             if (usev[pos] & need) {         // 原来为 BASE 还能继续 USED
+               continue;
+             }
+
+             for (cp = tp->child; cp; cp = cp->next) {
+               if (usev[pos + cp->sym] & USED) break;
+             }
+
+             // No child needs an in-use slot? We're done.
+             if (!cp) break;
+             // 找到连续的位置 所有tp的child 都有可用 slot   (not USED)
+           }
+           tp->state = pos;    // tp 存储child的 start pos
+
+           // Mark node's base and children as used:
+           usev[pos] |= need;
+           unsigned last = 0; // Make compiler happy
+           int nkids = 0;
+           for (cp = tp->child; cp; *dstp++ = cp, cp = cp->next, ++nkids)
+             usev[last = pos + cp->sym] |= USED;             // 事先为child找到的slot，标记上 USED
+
+           // This is a HEURISTIC for advancing search for other nodes
+           *startp += (pos - *startp) / nkids;
+
+           if (last_trans < last) {
+             last_trans = last;
+             if (last + nsyms >= usev_size) {
+               usev = static_cast<char*>(realloc(usev, usev_size << 1));   // 如果数组长度不够，扩大两倍
+               memset(usev + usev_size, 0, usev_size);
+               usev_size <<= 1;
+             }
+           }
+         }
+         ,*dstp = NULL;
+       }
+       free(usev);
+       return last_trans + 1;
+     }
+   #+end_src
+** 数组化分配空间
+   最终将Trie数组化目的地为 ~ACISM::tranv~ 和 ~ACISM::hashv~
+
+   需要实现分配内存，分配路径如下
+   #+begin_src c++
+     int     nhash = 0;
+     TNODE*  tp = troot + nnodes;
+     while (--tp > troot)
+       nhash += tp->match && tp->child;      // 非leaf节点，并且作为一个match pattern
+
+     psp->tran_size = interleave(troot, nnodes, psp->nsyms, v1, v2);  // psp->tran_size: 所需数组的大小
+
+     if (nhash) {
+       // Hash table is for match info of non-leaf nodes (only).
+       // Set hash_size for p_size(psp):
+       psp->hash_mod = nhash * 5 / 4 + 1;
+       // Initially oversize the table for overflows without wraparound.
+       psp->hash_size = psp->hash_mod + nhash;    // 存在作为matc pattern的中间节点时，才会启用 ACISM::hashv 数组
+      }
+
+     static inline size_t p_size(ACISM const *psp)
+     { return psp->hash_size * sizeof*psp->hashv
+           + psp->tran_size * sizeof*psp->tranv; }
+     static inline void set_tranv(ACISM *psp, void *mem)
+     { psp->hashv = (STRASH*)&(psp->tranv = (unsigned*)mem)[psp->tran_size]; }
+
+     set_tranv(psp, calloc(p_size(psp), 1));    // tranv 和 hashv 统一分配内存，指向不同位置
+   #+end_src
+** 填充数组
+   比较复杂
+   #+begin_src c++
+     // (ns) is either a STATE, or a (STRNO + tran_size)
+     static inline void
+     set_tran(ACISM *psp, unsigned s, unsigned short sym, int match, int suffix, unsigned ns)
+     {
+       // sym 占用低位
+       // IS_MATCH  IS_SUFFIX 占用最高两位
+       // ns 占用中间位
+       psp->tranv[s + sym] = sym | (match ? IS_MATCH : 0) \
+           | (suffix ? IS_SUFFIX : 0)
+           | (ns << SYM_BITS);
+     }
+
+     static void fill_tranv(ACISM *psp, TNODE const*tp)
+     {
+       TNODE const *cp = tp->child;
+
+       if (cp && tp->back)
+         set_tran(psp, tp->state, 0, 0, 0, tp->back->state);    // 存储tp信息， tp->back->state 存储back节点pos信息
+
+       for (; cp; cp = cp->next) {
+         //NOTE: cp->match is (strno+1) so that !cp->match means "no match".
+         set_tran(psp, tp->state, cp->sym, cp->match, cp->is_suffix,
+                  cp->child ? cp->state : cp->match - 1 + psp->tran_size);  // 最后一个参数，存储 cp 节点pos信息，主要关照到cp的child节点
+         if (cp->child)
+           fill_tranv(psp, cp);    // 递归fill
+       }
+     }
+   #+end_src
+** 额外填充 hashv 数组
+   #+begin_src c++
+     static inline unsigned  p_hash(ACISM const *psp, unsigned s)
+     { return s * 107 % psp->hash_mod; }
+
+     // hash_mode 值大于等于所有作为match patter的中间节点的数量
+     // hash方便快速查找到这些节点在数组中的位置，产生冲突，采用向后偏移的方式
+     static void fill_hashv(ACISM *psp, TNODE const treev[], int nnodes)
+     {
+       // hash_mode 可以理解为bucket数量
+       // sv sp 额外的空闲bucket
+       STRASH *sv = static_cast<STRASH*>(malloc(psp->hash_mod * sizeof*sv)), *sp = sv;
+       int i;
+       for (i = 0; i < nnodes; ++i) {   // 遍历所有节点
+         unsigned base = treev[i].state;
+         TNODE const *tp;
+         for (tp = treev[i].child; tp; tp = tp->next) {
+           if (tp->match && tp->child) {    // 找出作为match patter的中间节点
+             unsigned state = base + tp->sym;      // 得到在 ACISM::tranv 数组的位置
+             STRASH *hp = &psp->hashv[p_hash(psp, state)];    // 计算hash值，获取对应bucket
+             // 如果hp已被占用，顺序寻找下一个空闲bucket，否者使用hp
+             *(hp->state ? sp++ : hp) = (STRASH){state, tp->match - 1};
+           }
+         }
+       }
+
+       while (--sp >= sv) {
+         // 如何确保 i 不会大于等于 psp->has_mod 加个求余操作保险?
+         // 本身空间上有冗余。。。  比较复杂
+         for (i = p_hash(psp, sp->state); psp->hashv[i].state; ++i);   // 找到空闲位置放置 sp
+         psp->hashv[i] = *sp;
+       }
+
+       free(sv);
+     }
+
+
+     if (nhash) {
+       fill_hashv(psp, troot, nnodes);
+     }
+   #+end_src
+** 文本匹配
+   太复杂了，细节太多，还是没有看透
+
+   核心函数如下
+   #+begin_src c++
+     // p_tran 位置转移
+     static inline unsigned  p_tran(ACISM const *psp, unsigned s, unsigned sym)
+     { return psp->tranv[s + sym] ^ sym; }
+     // 找下一个兄弟节点
+     static inline unsigned   t_next(ACISM const *psp, unsigned t)   { (void)psp; return (t & ~T_FLAGS) >> SYM_BITS; }
+     static inline int     t_isleaf(ACISM const *psp, unsigned t) { return t_next(psp, t) >= psp->tran_size; }
+     static inline unsigned t_sym(ACISM const *psp, unsigned t)    { (void)psp; return t & SYM_MASK; }
+     static inline unsigned t_valid(ACISM const *psp, unsigned t)  { return !t_sym(psp, t); }
+     // t_valid(psp, next = p_tran(psp, state, sym); new_state = t_next(next) 可用于查找sym 对应子节点
+     // p_tran(psp, state, sym) & SYM_MASK 必须为0，才能验证子节点的有效性，然后通过 t_next(next) 获取transv中的实际位置
+
+     static inline int     t_strno(ACISM const *psp, unsigned t)  { return t_next(psp, t) - psp->tran_size; }
+
+
+     // psp: 之前生成的核心数据结构
+     // text = {line, line.size()}    待匹配文本
+     // cb:  匹配成功后的回调函数
+     // context:
+     // statep:
+     int acism_more(ACISM const *psp, MEMREF const text,
+                ACISM_ACTION *cb, void *context, int *statep)
+     {
+       char const *cp = text.ptr, *endp = cp + text.len;
+       unsigned state = *statep;
+       int ret = 0;
+
+       while (cp < endp) {
+         unsigned sym = psp->symv[(uint8_t)*cp++];  // 映射到 ACISM 中的紧凑 id
+
+         if (!sym) {
+           // Input byte is not in any pattern string.
+           state = ROOT;
+           continue;
+         }
+
+         unsigned next;
+         while (!t_valid(psp, next = p_tran(psp, state, sym)) && state != ROOT) {
+           unsigned back = p_tran(psp, state, BACK);
+           state = t_valid(psp, back) ? t_next(psp, back) : ROOT;
+         }
+
+         if (!t_valid(psp, next))
+           continue;
+
+         if (!(next & (IS_MATCH | IS_SUFFIX))) {
+           // No complete match yet; keep going.
+           state = t_next(psp, next);
+           continue;
+         }
+
+         // At this point, one or more patterns have matched.
+         // Find all matches by following the backref chain.
+         // A valid node for (sym) with no SUFFIX flag marks the
+         //  end of the suffix chain.
+         // In the same backref traversal, find a new (state),
+         //  if the original transition is to a leaf.
+
+         unsigned s = state;
+
+         // Initially state is ROOT. The chain search saves the
+         //  first state from which the next char has a transition.
+         state = t_isleaf(psp, next) ? 0 : t_next(psp, next);
+
+         while (1) {
+           if (t_valid(psp, next)) {
+             if (next & IS_MATCH) {
+               unsigned strno, ss = s + sym, i;
+               if (t_isleaf(psp, psp->tranv[ss])) {
+                 strno = t_strno(psp, psp->tranv[ss]);
+               } else {
+                 for (i = p_hash(psp, ss); psp->hashv[i].state != ss; ++i);
+                 strno = psp->hashv[i].strno;
+               }
+
+               if ((ret = cb(strno, cp - text.ptr, context)))
+                 return *statep = state, ret;
+             }
+             // If the original match was a leaf, state was set to 0, to be set
+             //  The first node in the backref chain with a forward transition
+             if (!state && !t_isleaf(psp, next))
+               state = t_next(psp, next);
+             if ( state && !(next & IS_SUFFIX))
+               break;
+           }
+
+           if (s == ROOT)
+             break;
+
+           unsigned b = p_tran(psp, s, BACK);
+           s = t_valid(psp, b) ? t_next(psp, b) : ROOT;
+           next = p_tran(psp, s, sym);
+         }
+       }
+
+       return *statep = state, ret;
+     }
+   #+end_src
